@@ -1,0 +1,636 @@
+#include <Wire.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Adafruit_INA219.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <DHT.h>
+#include <LiquidCrystal_I2C.h>
+
+// =====================================================
+//                    PIN DEFINITIONS
+// =====================================================
+
+#define SDA_PIN       21
+#define SCL_PIN       22
+
+#define DS18B20_PIN    4
+#define DHT_PIN        5
+#define DHT_TYPE       DHT11
+
+// =====================================================
+//                     WIFI SETTINGS
+// =====================================================
+
+const char* WIFI_SSID     = "YOUR_WIFI_NAME";
+const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+
+// =====================================================
+//                       OBJECTS
+// =====================================================
+
+Adafruit_INA219 ina219;
+
+OneWire oneWire(DS18B20_PIN);
+DallasTemperature ds18b20(&oneWire);
+
+DHT dht(DHT_PIN, DHT_TYPE);
+
+// Most 16x2 I2C LCDs use 0x27.
+// If yours doesn't work, try 0x3F.
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+WebServer server(80);
+
+// =====================================================
+//                    SENSOR VARIABLES
+// =====================================================
+
+float voltage = 0.0;
+float current = 0.0;
+float power = 0.0;
+
+float batteryTemp = 0.0;
+float ambientTemp = 0.0;
+float humidity = 0.0;
+
+// =====================================================
+//                    AI / STATUS VALUES
+// =====================================================
+
+float riskScore = 0.0;
+float estimatedSoH = 100.0;
+
+String batteryStatus = "NORMAL";
+String explanation = "Battery operating normally.";
+
+// =====================================================
+//                  LCD SCREEN CONTROL
+// =====================================================
+
+unsigned long lastLCDChange = 0;
+int lcdScreen = 0;
+
+// =====================================================
+//                       TIMING
+// =====================================================
+
+unsigned long lastSensorRead = 0;
+const unsigned long SENSOR_INTERVAL = 1000;
+
+// =====================================================
+//                    READ ALL SENSORS
+// =====================================================
+
+void readSensors() {
+
+  // ---------------- INA219 ----------------
+
+  float shuntVoltage_mV = ina219.getShuntVoltage_mV();
+  float busVoltage_V = ina219.getBusVoltage_V();
+
+  current = ina219.getCurrent_mA() / 1000.0;
+
+  // Actual voltage at load/battery side
+  voltage = busVoltage_V + (shuntVoltage_mV / 1000.0);
+
+  power = voltage * current;
+
+
+  // ---------------- DS18B20 ----------------
+
+  ds18b20.requestTemperatures();
+
+  batteryTemp = ds18b20.getTempCByIndex(0);
+
+  if (batteryTemp == DEVICE_DISCONNECTED_C) {
+    batteryTemp = -127.0;
+  }
+
+
+  // ---------------- DHT11 ----------------
+
+  float newAmbientTemp = dht.readTemperature();
+  float newHumidity = dht.readHumidity();
+
+  if (!isnan(newAmbientTemp)) {
+    ambientTemp = newAmbientTemp;
+  }
+
+  if (!isnan(newHumidity)) {
+    humidity = newHumidity;
+  }
+
+
+  // ---------------- SAFETY / DEMO AI ----------------
+
+  calculateRisk();
+}
+
+// =====================================================
+//                 SAFETY RISK CALCULATION
+// =====================================================
+
+void calculateRisk() {
+
+  riskScore = 0;
+
+  // Battery temperature
+  if (batteryTemp >= 40) {
+    riskScore += 40;
+  }
+  else if (batteryTemp >= 35) {
+    riskScore += 25;
+  }
+  else if (batteryTemp >= 32) {
+    riskScore += 10;
+  }
+
+  // Current
+  if (current >= 4.0) {
+    riskScore += 35;
+  }
+  else if (current >= 3.0) {
+    riskScore += 20;
+  }
+  else if (current >= 2.0) {
+    riskScore += 10;
+  }
+
+  // Voltage
+  if (voltage < 10.5) {
+    riskScore += 30;
+  }
+  else if (voltage < 11.0) {
+    riskScore += 20;
+  }
+  else if (voltage < 11.5) {
+    riskScore += 10;
+  }
+
+  // Limit risk
+  if (riskScore > 100) {
+    riskScore = 100;
+  }
+
+
+  // ---------------- STATUS ----------------
+
+  if (riskScore >= 70) {
+
+    batteryStatus = "HIGH RISK";
+
+    explanation =
+      "High battery stress detected.";
+
+  }
+  else if (riskScore >= 40) {
+
+    batteryStatus = "WARNING";
+
+    explanation =
+      "Temperature, current or voltage is above normal.";
+
+  }
+  else {
+
+    batteryStatus = "NORMAL";
+
+    explanation =
+      "Battery operating within normal range.";
+  }
+
+
+  // ---------------- DEMO SoH ----------------
+  //
+  // This is NOT a real battery SoH model.
+  // Replace this with your trained AI model later.
+
+  estimatedSoH = 100.0 - (riskScore * 0.12);
+
+  if (estimatedSoH < 50) {
+    estimatedSoH = 50;
+  }
+}
+
+// =====================================================
+//                     LCD DISPLAY
+// =====================================================
+
+void updateLCD() {
+
+  if (millis() - lastLCDChange < 3000) {
+    return;
+  }
+
+  lastLCDChange = millis();
+
+  lcd.clear();
+
+  // ---------------- SCREEN 1 ----------------
+
+  if (lcdScreen == 0) {
+
+    lcd.setCursor(0, 0);
+    lcd.print("V:");
+    lcd.print(voltage, 2);
+    lcd.print(" I:");
+    lcd.print(current, 2);
+
+    lcd.setCursor(0, 1);
+    lcd.print("P:");
+    lcd.print(power, 1);
+    lcd.print("W");
+
+    lcdScreen = 1;
+  }
+
+  // ---------------- SCREEN 2 ----------------
+
+  else if (lcdScreen == 1) {
+
+    lcd.setCursor(0, 0);
+    lcd.print("Batt Temp:");
+
+    lcd.setCursor(0, 1);
+    lcd.print(batteryTemp, 1);
+    lcd.print((char)223);
+    lcd.print("C");
+
+    lcdScreen = 2;
+  }
+
+  // ---------------- SCREEN 3 ----------------
+
+  else if (lcdScreen == 2) {
+
+    lcd.setCursor(0, 0);
+    lcd.print("Ambient:");
+    lcd.print(ambientTemp, 1);
+    lcd.print((char)223);
+    lcd.print("C");
+
+    lcd.setCursor(0, 1);
+    lcd.print("Humidity:");
+    lcd.print(humidity, 0);
+    lcd.print("%");
+
+    lcdScreen = 3;
+  }
+
+  // ---------------- SCREEN 4 ----------------
+
+  else if (lcdScreen == 3) {
+
+    lcd.setCursor(0, 0);
+    lcd.print("Risk:");
+    lcd.print(riskScore, 0);
+    lcd.print("%");
+
+    lcd.setCursor(0, 1);
+    lcd.print(batteryStatus);
+
+    lcdScreen = 4;
+  }
+
+  // ---------------- SCREEN 5 ----------------
+
+  else {
+
+    lcd.setCursor(0, 0);
+    lcd.print("SoH:");
+    lcd.print(estimatedSoH, 0);
+    lcd.print("%");
+
+    lcd.setCursor(0, 1);
+    lcd.print("Battery Guard AI");
+
+    lcdScreen = 0;
+  }
+}
+
+// =====================================================
+//                    JSON API
+// =====================================================
+
+String getJSON() {
+
+  String json = "{";
+
+  json += "\"voltage\":";
+  json += String(voltage, 2);
+  json += ",";
+
+  json += "\"current\":";
+  json += String(current, 2);
+  json += ",";
+
+  json += "\"power\":";
+  json += String(power, 2);
+  json += ",";
+
+  json += "\"battery_temp\":";
+  json += String(batteryTemp, 2);
+  json += ",";
+
+  json += "\"ambient_temp\":";
+  json += String(ambientTemp, 2);
+  json += ",";
+
+  json += "\"humidity\":";
+  json += String(humidity, 2);
+  json += ",";
+
+  json += "\"risk\":";
+  json += String(riskScore, 0);
+  json += ",";
+
+  json += "\"soh\":";
+  json += String(estimatedSoH, 0);
+  json += ",";
+
+  json += "\"status\":\"";
+  json += batteryStatus;
+  json += "\",";
+
+  json += "\"explanation\":\"";
+  json += explanation;
+  json += "\"";
+
+  json += "}";
+
+  return json;
+}
+
+// =====================================================
+//                    WEB API HANDLER
+// =====================================================
+
+void handleAPI() {
+
+  // Allow your dashboard to request the data
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+
+  server.send(200, "application/json", getJSON());
+}
+
+// =====================================================
+//                    WEB HOME PAGE
+// =====================================================
+
+void handleHome() {
+
+  String page = "";
+
+  page += "<html>";
+  page += "<head>";
+  page += "<title>Battery Guard AI</title>";
+  page += "</head>";
+
+  page += "<body>";
+
+  page += "<h1>Battery Guard AI</h1>";
+
+  page += "<p>Voltage: ";
+  page += String(voltage, 2);
+  page += " V</p>";
+
+  page += "<p>Current: ";
+  page += String(current, 2);
+  page += " A</p>";
+
+  page += "<p>Power: ";
+  page += String(power, 2);
+  page += " W</p>";
+
+  page += "<p>Battery Temperature: ";
+  page += String(batteryTemp, 1);
+  page += " C</p>";
+
+  page += "<p>Ambient Temperature: ";
+  page += String(ambientTemp, 1);
+  page += " C</p>";
+
+  page += "<p>Humidity: ";
+  page += String(humidity, 0);
+  page += " %</p>";
+
+  page += "<h2>Status: ";
+  page += batteryStatus;
+  page += "</h2>";
+
+  page += "<p>Risk: ";
+  page += String(riskScore, 0);
+  page += " %</p>";
+
+  page += "<p>Estimated SoH: ";
+  page += String(estimatedSoH, 0);
+  page += " %</p>";
+
+  page += "<p>Explanation: ";
+  page += explanation;
+  page += "</p>";
+
+  page += "</body>";
+  page += "</html>";
+
+  server.send(200, "text/html", page);
+}
+
+// =====================================================
+//                       SETUP
+// =====================================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  delay(1000);
+
+  Serial.println();
+  Serial.println("==============================");
+  Serial.println("   BATTERY GUARD AI");
+  Serial.println("==============================");
+
+
+  // ---------------- I2C ----------------
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+
+  // ---------------- INA219 ----------------
+
+  if (!ina219.begin()) {
+
+    Serial.println("ERROR: INA219 NOT FOUND!");
+
+    while (1) {
+      delay(1000);
+    }
+  }
+
+  Serial.println("INA219 OK");
+
+
+  // ---------------- DS18B20 ----------------
+
+  ds18b20.begin();
+
+  Serial.println("DS18B20 OK");
+
+
+  // ---------------- DHT11 ----------------
+
+  dht.begin();
+
+  Serial.println("DHT11 OK");
+
+
+  // ---------------- LCD ----------------
+
+  lcd.init();
+  lcd.backlight();
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print("Battery Guard");
+
+  lcd.setCursor(0, 1);
+  lcd.print("Starting...");
+
+  delay(2000);
+
+
+  // ---------------- WIFI ----------------
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print("Connecting WiFi");
+
+  Serial.print("Connecting to Wi-Fi");
+
+  int attempts = 0;
+
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+
+    delay(500);
+
+    Serial.print(".");
+
+    attempts++;
+  }
+
+  Serial.println();
+
+
+  if (WiFi.status() == WL_CONNECTED) {
+
+    Serial.println("Wi-Fi connected!");
+
+    Serial.print("ESP32 IP: ");
+    Serial.println(WiFi.localIP());
+
+    lcd.clear();
+
+    lcd.setCursor(0, 0);
+    lcd.print("WiFi Connected");
+
+    lcd.setCursor(0, 1);
+    lcd.print(WiFi.localIP());
+
+    delay(3000);
+  }
+
+  else {
+
+    Serial.println("Wi-Fi connection failed.");
+
+    lcd.clear();
+
+    lcd.setCursor(0, 0);
+    lcd.print("WiFi Failed");
+
+    delay(2000);
+  }
+
+
+  // ---------------- WEB SERVER ----------------
+
+  server.on("/", handleHome);
+
+  server.on("/api/data", handleAPI);
+
+  server.begin();
+
+  Serial.println("Web server started.");
+
+  Serial.println("==============================");
+}
+
+// =====================================================
+//                       LOOP
+// =====================================================
+
+void loop() {
+
+  // Read sensors every second
+  if (millis() - lastSensorRead >= SENSOR_INTERVAL) {
+
+    lastSensorRead = millis();
+
+    readSensors();
+
+    updateLCD();
+
+
+    // ---------------- SERIAL OUTPUT ----------------
+
+    Serial.println("------------------------------");
+
+    Serial.print("Voltage: ");
+    Serial.print(voltage, 2);
+    Serial.println(" V");
+
+    Serial.print("Current: ");
+    Serial.print(current, 2);
+    Serial.println(" A");
+
+    Serial.print("Power: ");
+    Serial.print(power, 2);
+    Serial.println(" W");
+
+    Serial.print("Battery Temp: ");
+    Serial.print(batteryTemp, 2);
+    Serial.println(" C");
+
+    Serial.print("Ambient Temp: ");
+    Serial.print(ambientTemp, 2);
+    Serial.println(" C");
+
+    Serial.print("Humidity: ");
+    Serial.print(humidity, 2);
+    Serial.println(" %");
+
+    Serial.print("Risk: ");
+    Serial.print(riskScore, 0);
+    Serial.println(" %");
+
+    Serial.print("SoH Estimate: ");
+    Serial.print(estimatedSoH, 0);
+    Serial.println(" %");
+
+    Serial.print("Status: ");
+    Serial.println(batteryStatus);
+
+    Serial.println("JSON:");
+    Serial.println(getJSON());
+  }
+
+
+  // Handle Wi-Fi requests
+  server.handleClient();
+}
