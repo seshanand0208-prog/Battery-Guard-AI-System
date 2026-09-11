@@ -1,4 +1,5 @@
 Battery Guard AI 🔋🤖
+
 Introduction
 
 Battery Guard AI is an intelligent battery monitoring and safety system designed to monitor the condition and performance of a 12 V battery in real time. The project combines IoT sensors, an ESP32 microcontroller, Wi-Fi communication, and AI-based analysis to provide useful information about battery health and potential safety risks.
